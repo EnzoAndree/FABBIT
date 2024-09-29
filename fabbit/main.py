@@ -140,7 +140,7 @@ def predict_orfs(filename, output_dir, meta_mode=False):
     with open_func(genome_path, mode) as handle:
         for record in SeqIO.parse(handle, "fasta"):
             accumulated_seq.write(bytes(record.seq))
-            if len(accumulated_seq.getvalue()) >= 20000:
+            if len(accumulated_seq.getvalue()) >= 100000:
                 break
 
     if not meta_mode:
