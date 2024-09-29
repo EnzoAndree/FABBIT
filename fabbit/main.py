@@ -100,7 +100,7 @@ def calculate_shannon_entropy(align: MultipleSeqAlignment):
     return np.nanmean(entropies)  # Return the mean entropy of the columns
 
 def create_output_directories(output_dir):
-    subdirs = ['pyrodigal_orfs', 'core_genome_genes', 'core_genome_concatenated']
+    subdirs = ['pyrodigal_orfs', 'core_genome_genes']
     for subdir in subdirs:
         path = os.path.join(output_dir, subdir)
         os.makedirs(path, exist_ok=True)
@@ -556,7 +556,6 @@ def main():
     results_table_path = output_dir / 'AAI_table.csv'
     pyrodigal_orfs = output_dir / 'pyrodigal_orfs'
     core_genome_genes = output_dir / 'core_genome_genes'
-    core_genome_concatenated = output_dir / 'core_genome_concatenated'
 
     # Process genomes and predict ORFs
     process_genomes(input_files, pyrodigal_orfs, max_workers=args.threads)
