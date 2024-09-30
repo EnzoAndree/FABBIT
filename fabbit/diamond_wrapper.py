@@ -23,7 +23,6 @@ class DIAMOND:
             command = [self.diamond_path] + command
         else:
             raise ValueError("Command must be a string or a list")
-        print(command)
         process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if process.returncode != 0:
             raise Exception(f"Command '{' '.join(command)}' failed with return code {process.returncode}:\n{process.stderr}")
