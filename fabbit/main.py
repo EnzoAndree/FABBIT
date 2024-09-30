@@ -20,6 +20,7 @@ from Bio import AlignIO
 import tempfile
 import logging
 import matplotlib.pyplot as plt
+import time
 
 __version__ = "1.0.0"  # Single source of truth for version
 
@@ -311,6 +312,7 @@ def extract_and_align_gene(core_gene, coregenome_matrix, fna_dir, output_dir, ma
         return f"Alignment already exists for {core_gene}, skipping..."
     
     input_fasta = StringIO()
+    start_time = time.time()
     for genome_id in coregenome_matrix.columns[1:]:  # Excludes 'Core_Gene'
         gene_id = coregenome_matrix.loc[coregenome_matrix['Core_Gene'] == core_gene, genome_id].iloc[0]
         
@@ -325,14 +327,17 @@ def extract_and_align_gene(core_gene, coregenome_matrix, fna_dir, output_dir, ma
                 input_fasta.write(f">{genome_id}\n{seq.seq}\n")
         except Exception as e:
             logging.error(f"Could not process {str(fna_file)} for {gene_id}: {e}")
+    read_time = time.time() - start_time
     
     # Align sequences using MAFFT
     input_sequences = input_fasta.getvalue()
     input_fasta.close()
     
     if input_sequences.strip():  # Check if there are sequences to align
+        start_time = time.time()
         mafft.align_and_save(input_sequences, str(output_file), algorithm="auto")
-        return f"Alignment saved for {core_gene}"
+        align_time = time.time() - start_time
+        return f"Alignment saved for {core_gene} - Read time: {read_time:.2f}s, Align time: {align_time:.2f}s" 
     else:
         return f"No sequences to align for {core_gene}, skipping..."
 
