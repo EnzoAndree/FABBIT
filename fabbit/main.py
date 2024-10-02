@@ -375,6 +375,9 @@ async def extract_align_and_save_core_genes(coregenome_matrix, orf_fnas, output_
     extraction_queue = asyncio.Queue()
     alignment_queue = asyncio.Queue()
 
+    # Count existing alignment files
+    existing_alignments = sum(1 for gene in core_genes if (Path(output_dir) / f"{gene}.aln").exists())
+
     # Add extraction tasks to the queue
     for gene in core_genes:
         await extraction_queue.put(gene)
@@ -387,7 +390,10 @@ async def extract_align_and_save_core_genes(coregenome_matrix, orf_fnas, output_
     extraction_pbar = tqdm(total=len(core_genes), desc="Extracting genes", position=0)
     alignment_pbar = tqdm(total=len(core_genes), desc="Aligning genes", position=1)
     
-    # Initialize locks for progress bars
+    # Update extraction progress bar for existing alignments
+    extraction_pbar.update(existing_alignments)
+    alignment_pbar.update(existing_alignments)
+
     extraction_lock = asyncio.Lock()
     alignment_lock = asyncio.Lock()
     
