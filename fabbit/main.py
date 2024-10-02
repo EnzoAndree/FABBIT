@@ -24,6 +24,7 @@ import time
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import gc
+from tqdm.asyncio import tqdm as atqdm
 
 __version__ = "1.0.0"  # Single source of truth for version
 
@@ -352,48 +353,95 @@ def align_and_save_gene(core_gene, sequences, output_dir, mafft):
 
 async def extract_align_and_save_core_genes(coregenome_matrix, orf_fnas, output_dir, max_workers=4):
     """
-    Extracts core genome genes asynchronously, aligns them concurrently as they become available,
-    and frees memory for completed genes.
+    Extrae genes del genoma central de forma asíncrona, los alinea concurrentemente a medida que están disponibles,
+    y libera memoria para los genes completados.
     """
     core_genes = coregenome_matrix['Core_Gene'].tolist()
     mafft = MAFFT()
     
-    # Ensure output directory exists
+    # Asegurar que el directorio de salida existe
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     
-    # Create a ThreadPoolExecutor for alignment tasks
-    alignment_executor = ThreadPoolExecutor(max_workers=max_workers)
-    alignment_tasks = {}
-    gene_sequences = {}
+    # Crear colas para las tareas de extracción y alineamiento
+    extraction_queue = asyncio.Queue()
+    alignment_queue = asyncio.Queue()
 
-    # Create extraction tasks
-    extraction_tasks = [check_and_extract_gene_sequences(gene, coregenome_matrix, orf_fnas, output_dir) for gene in core_genes]
+    # Agregar tareas de extracción a la cola
+    for gene in core_genes:
+        await extraction_queue.put(gene)
     
-    # Process extraction tasks and launch alignment tasks concurrently
-    for extraction_task in tqdm(asyncio.as_completed(extraction_tasks), total=len(core_genes), desc="Extracting genes"):
-        gene, sequences, message = await extraction_task
-        if sequences is not None:
-            gene_sequences[gene] = sequences
-            
-            # Launch alignment task
-            alignment_task = alignment_executor.submit(align_and_save_gene, gene, sequences, output_dir, mafft)
-            alignment_tasks[gene] = alignment_task
-        else:
-            logging.info(message)
+    # Agregar valores sentinela para indicar a los trabajadores que terminen
+    for _ in range(max_workers):
+        await extraction_queue.put(None)
     
-    # Wait for alignment tasks to complete and free memory
-    for gene, task in tqdm(alignment_tasks.items(), desc="Aligning genes"):
-        try:
-            _, result = task.result()
-            logging.info(result)
-            
-            # Free memory for the completed gene
-            del gene_sequences[gene]
-            gc.collect()  # Force garbage collection
-        except Exception as e:
-            logging.error(f"Error processing gene {gene}: {e}")
+    # Inicializar barras de progreso
+    extraction_pbar = tqdm(total=len(core_genes), desc="Extrayendo genes", position=0)
+    alignment_pbar = tqdm(total=len(core_genes), desc="Alineando genes", position=1)
     
-    # Shutdown the executor
+    # Inicializar locks para las barras de progreso
+    extraction_lock = asyncio.Lock()
+    alignment_lock = asyncio.Lock()
+    
+    # Crear un ThreadPoolExecutor para las tareas de alineamiento
+    alignment_executor = ThreadPoolExecutor(max_workers=max_workers)
+    
+    async def extract_worker():
+        while True:
+            gene = await extraction_queue.get()
+            if gene is None:
+                # Señalar a los trabajadores de alineamiento que terminen
+                await alignment_queue.put(None)
+                extraction_queue.task_done()
+                break
+            gene, sequences, message = await check_and_extract_gene_sequences(
+                gene, coregenome_matrix, orf_fnas, output_dir
+            )
+            if sequences is not None:
+                await alignment_queue.put((gene, sequences))
+            else:
+                logging.info(message)
+            extraction_queue.task_done()
+            async with extraction_lock:
+                extraction_pbar.update(1)
+    
+    async def align_worker():
+        while True:
+            item = await alignment_queue.get()
+            if item is None:
+                alignment_queue.task_done()
+                break
+            gene, sequences = item
+            try:
+                result = await asyncio.get_event_loop().run_in_executor(
+                    alignment_executor, align_and_save_gene, gene, sequences, output_dir, mafft
+                )
+                logging.info(result[1])
+            except Exception as e:
+                logging.error(f"Error procesando el gen {gene}: {e}")
+            finally:
+                alignment_queue.task_done()
+                async with alignment_lock:
+                    alignment_pbar.update(1)
+    
+    # Iniciar trabajadores de extracción
+    extraction_tasks = [asyncio.create_task(extract_worker()) for _ in range(max_workers)]
+    
+    # Iniciar trabajadores de alineamiento
+    alignment_tasks = [asyncio.create_task(align_worker()) for _ in range(max_workers)]
+    
+    # Esperar a que todas las extracciones y alineamientos completen
+    await extraction_queue.join()
+    await alignment_queue.join()
+    
+    # Cerrar barras de progreso
+    extraction_pbar.close()
+    alignment_pbar.close()
+    
+    # Cancelar tareas de los trabajadores
+    for task in extraction_tasks + alignment_tasks:
+        task.cancel()
+    
+    # Apagar el executor
     alignment_executor.shutdown()
 
 def compute_entropy(gene_file, core_genome_genes_dir):
