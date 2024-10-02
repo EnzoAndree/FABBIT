@@ -21,6 +21,9 @@ import tempfile
 import logging
 import matplotlib.pyplot as plt
 import time
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import gc
 
 __version__ = "1.0.0"  # Single source of truth for version
 
@@ -298,67 +301,100 @@ def parallel_bidirectional_best_hit(reference, queries, diamond_instance, output
 
     return result_df, coregenome_matrix
 
-def extract_and_align_gene(core_gene, coregenome_matrix, fna_dir, output_dir, mafft):
+async def check_and_extract_gene_sequences(core_gene, coregenome_matrix, orf_fnas, output_dir):
     """
-    Extracts a gene from the core genome, aligns it using MAFFT, and saves the result.
+    Checks if alignment file exists, and if not, extracts sequences for a core gene from all genomes asynchronously.
     """
-    # Create the output directory if it doesn't exist
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    
     output_file = Path(output_dir) / f"{core_gene}.aln"
     
     # Check if the alignment file already exists
     if output_file.exists():
-        return f"Alignment already exists for {core_gene}, skipping..."
-    
-    input_fasta = StringIO()
-    start_time = time.time()
+        return core_gene, None, f"Alignment already exists for {core_gene}, skipping extraction..."
+
+    sequences = []
     for genome_id in coregenome_matrix.columns[1:]:  # Excludes 'Core_Gene'
         gene_id = coregenome_matrix.loc[coregenome_matrix['Core_Gene'] == core_gene, genome_id].iloc[0]
         
-        fna_file = Path(fna_dir) / f"{genome_id}.fna"
         if pd.isna(gene_id):
-            input_fasta.write(f">{genome_id}\n-\n")
-            continue
-        try:
-            fa = pyfastx.Fasta(str(fna_file))
-            if gene_id in fa:
-                seq = fa[gene_id]
-                input_fasta.write(f">{genome_id}\n{seq.seq}\n")
-        except Exception as e:
-            logging.error(f"Could not process {str(fna_file)} for {gene_id}: {e}")
-    read_time = time.time() - start_time
+            sequences.append(f">{genome_id}\n-\n")
+        else:
+            try:
+                if genome_id in orf_fnas and gene_id in orf_fnas[genome_id]:
+                    seq = orf_fnas[genome_id][gene_id]
+                    sequences.append(f">{genome_id}\n{seq.seq}\n")
+                else:
+                    sequences.append(f">{genome_id}\n-\n")
+            except Exception as e:
+                logging.error(f"Could not process {genome_id} for {gene_id}: {e}")
+                sequences.append(f">{genome_id}\n-\n")
+        
+        # Add a small delay to allow other tasks to run
+        await asyncio.sleep(0)
     
-    # Align sequences using MAFFT
-    input_sequences = input_fasta.getvalue()
-    input_fasta.close()
-    
-    if input_sequences.strip():  # Check if there are sequences to align
-        start_time = time.time()
-        mafft.align_and_save(input_sequences, str(output_file), algorithm="auto")
-        align_time = time.time() - start_time
-        return f"Alignment saved for {core_gene} - Read time: {read_time:.2f}s, Align time: {align_time:.2f}s" 
-    else:
-        return f"No sequences to align for {core_gene}, skipping..."
+    return core_gene, "".join(sequences), "Sequences extracted successfully"
 
-def extract_align_and_save_core_genes_parallel(coregenome_matrix, fna_dir, output_dir, max_workers=4):
+def align_and_save_gene(core_gene, sequences, output_dir, mafft):
     """
-    Extracts core genome genes in parallel, aligns them, and saves the results.
+    Aligns sequences for a core gene using MAFFT and saves the result.
+    """
+    output_file = Path(output_dir) / f"{core_gene}.aln"
+    
+    if sequences is None:  # This means the alignment file already exists
+        return core_gene, f"Alignment already exists for {core_gene}, skipping..."
+    
+    if sequences.strip():  # Check if there are sequences to align
+        start_time = time.time()
+        mafft.align_and_save(sequences, str(output_file), algorithm="auto")
+        align_time = time.time() - start_time
+        return core_gene, f"Alignment saved for {core_gene} - Align time: {align_time:.2f}s" 
+    else:
+        return core_gene, f"No sequences to align for {core_gene}, skipping..."
+
+async def extract_align_and_save_core_genes(coregenome_matrix, orf_fnas, output_dir, max_workers=4):
+    """
+    Extracts core genome genes asynchronously, aligns them concurrently as they become available,
+    and frees memory for completed genes.
     """
     core_genes = coregenome_matrix['Core_Gene'].tolist()
     mafft = MAFFT()
     
-    # Use ProcessPoolExecutor for parallelization
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        # Use tqdm to visualize progress
-        futures = [executor.submit(extract_and_align_gene, gene, coregenome_matrix, fna_dir, output_dir, mafft) for gene in core_genes]
-        
-        for future in tqdm(futures, total=len(core_genes), desc="Extracting and aligning core genes"):
-            try:
-                result = future.result()
-                logging.info(result)
-            except Exception as e:
-                logging.error(f"Error processing a gene: {e}")
+    # Ensure output directory exists
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    
+    # Create a ThreadPoolExecutor for alignment tasks
+    alignment_executor = ThreadPoolExecutor(max_workers=max_workers)
+    alignment_tasks = {}
+    gene_sequences = {}
+
+    # Create extraction tasks
+    extraction_tasks = [check_and_extract_gene_sequences(gene, coregenome_matrix, orf_fnas, output_dir) for gene in core_genes]
+    
+    # Process extraction tasks and launch alignment tasks concurrently
+    for extraction_task in tqdm(asyncio.as_completed(extraction_tasks), total=len(core_genes), desc="Extracting genes"):
+        gene, sequences, message = await extraction_task
+        if sequences is not None:
+            gene_sequences[gene] = sequences
+            
+            # Launch alignment task
+            alignment_task = alignment_executor.submit(align_and_save_gene, gene, sequences, output_dir, mafft)
+            alignment_tasks[gene] = alignment_task
+        else:
+            logging.info(message)
+    
+    # Wait for alignment tasks to complete and free memory
+    for gene, task in tqdm(alignment_tasks.items(), desc="Aligning genes"):
+        try:
+            _, result = task.result()
+            logging.info(result)
+            
+            # Free memory for the completed gene
+            del gene_sequences[gene]
+            gc.collect()  # Force garbage collection
+        except Exception as e:
+            logging.error(f"Error processing gene {gene}: {e}")
+    
+    # Shutdown the executor
+    alignment_executor.shutdown()
 
 def compute_entropy(gene_file, core_genome_genes_dir):
     gene_id = os.path.splitext(gene_file)[0]
@@ -565,6 +601,11 @@ def main():
     # Process genomes and predict ORFs
     process_genomes(input_files, pyrodigal_orfs, max_workers=args.threads)
 
+    # Reading the orfs from the pyrodigal output
+    orf_fnas = {}
+    for fna in tqdm(list(pyrodigal_orfs.glob('*.fna')), desc="Reading ORFs"):
+        orf_fnas[fna.stem] = pyfastx.Fasta(str(fna))
+
     diamond = DIAMOND()
     faa_sample_files = [pyrodigal_orfs / (x.stem + '.faa') for x in input_files]
     
@@ -599,13 +640,13 @@ def main():
     results_table.to_csv(results_table_path, index=False)
     coregenome_matrix.to_csv(output_dir / 'core_genes_matrix.csv', index=False)
 
-    # Extract, align and save core genome genes in parallel
-    extract_align_and_save_core_genes_parallel(
+    # Extract, align and save core genome genes
+    asyncio.run(extract_align_and_save_core_genes(
         coregenome_matrix,
-        pyrodigal_orfs,
+        orf_fnas,
         core_genome_genes,
         max_workers=args.threads
-    )
+    ))
 
     # Now, concatenate the alignments
     concatenate_alignments(
