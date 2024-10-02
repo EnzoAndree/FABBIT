@@ -306,10 +306,12 @@ async def check_and_extract_gene_sequences(core_gene, coregenome_matrix, orf_fna
     """
     Checks if alignment file exists, and if not, extracts sequences for a core gene from all genomes asynchronously.
     """
+    start_time = time.time()
     output_file = Path(output_dir) / f"{core_gene}.aln"
     
     # Check if the alignment file already exists
     if output_file.exists():
+        end_time = time.time()
         return core_gene, None, f"Alignment already exists for {core_gene}, skipping extraction..."
 
     sequences = []
@@ -332,7 +334,8 @@ async def check_and_extract_gene_sequences(core_gene, coregenome_matrix, orf_fna
         # Add a small delay to allow other tasks to run
         await asyncio.sleep(0)
     
-    return core_gene, "".join(sequences), "Sequences extracted successfully"
+    end_time = time.time()
+    return core_gene, "".join(sequences), f"Sequences {core_gene} extracted - Extraction time: {end_time - start_time:.2f}s"
 
 def align_and_save_gene(core_gene, sequences, output_dir, mafft):
     """
@@ -418,6 +421,7 @@ async def extract_align_and_save_core_genes(coregenome_matrix, orf_fnas, output_
                 await alignment_queue.put((gene, sequences))
                 async with extraction_lock:
                     extraction_pbar.update(1)
+                logging.info(message)
             else:
                 logging.info(message)
             extraction_queue.task_done()
