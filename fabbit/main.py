@@ -376,7 +376,15 @@ async def extract_align_and_save_core_genes(coregenome_matrix, orf_fnas, output_
     alignment_queue = asyncio.Queue()
 
     # Count existing alignment files
+    total_core_genes = len(core_genes)
     existing_alignments = sum(1 for gene in core_genes if (Path(output_dir) / f"{gene}.aln").exists())
+    genes_to_process = total_core_genes - existing_alignments
+
+    # Print summary before starting progress bars
+    print(f"Total core genes: {total_core_genes}")
+    print(f"Already processed: {existing_alignments}")
+    print(f"Remaining to process: {genes_to_process}")
+    print("Starting extraction and alignment...")
 
     # Add extraction tasks to the queue
     for gene in core_genes:
@@ -386,13 +394,8 @@ async def extract_align_and_save_core_genes(coregenome_matrix, orf_fnas, output_
     for _ in range(max_workers):
         await extraction_queue.put(None)
     
-    # Initialize progress bars
-    extraction_pbar = tqdm(total=len(core_genes), desc="Extracting genes", position=0)
-    alignment_pbar = tqdm(total=len(core_genes), desc="Aligning genes", position=1)
-    
-    # Update extraction progress bar for existing alignments
-    extraction_pbar.update(existing_alignments)
-    alignment_pbar.update(existing_alignments)
+    extraction_pbar = tqdm(total=genes_to_process, desc="Extracting genes", position=0)
+    alignment_pbar = tqdm(total=genes_to_process, desc="Aligning genes", position=1)
 
     extraction_lock = asyncio.Lock()
     alignment_lock = asyncio.Lock()
@@ -413,11 +416,11 @@ async def extract_align_and_save_core_genes(coregenome_matrix, orf_fnas, output_
             )
             if sequences is not None:
                 await alignment_queue.put((gene, sequences))
+                async with extraction_lock:
+                    extraction_pbar.update(1)
             else:
                 logging.info(message)
             extraction_queue.task_done()
-            async with extraction_lock:
-                extraction_pbar.update(1)
     
     async def align_worker():
         while True:
@@ -456,7 +459,6 @@ async def extract_align_and_save_core_genes(coregenome_matrix, orf_fnas, output_
     for task in extraction_tasks + alignment_tasks:
         task.cancel()
     
-    # Shut down the executor
     alignment_executor.shutdown()
 
 def compute_entropy(gene_file, core_genome_genes_dir):
