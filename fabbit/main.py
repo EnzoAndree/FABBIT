@@ -191,7 +191,7 @@ def process_genomes(input_files, output_dir, max_workers=None):
         # Create a tqdm iterable for a progress bar
         futures = {executor.submit(predict_orfs, filename, output_dir): filename for filename in input_files}
         
-        for future in tqdm(as_completed(futures), total=len(input_files)):
+        for future in tqdm(as_completed(futures), total=len(input_files), desc="Predicting ORFs"):
             filename = futures[future]
             try:
                 future.result()
