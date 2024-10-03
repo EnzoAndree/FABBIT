@@ -25,6 +25,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import gc
 from tqdm.asyncio import tqdm as atqdm
+import json
 
 __version__ = "1.0.0"  # Single source of truth for version
 
@@ -180,6 +181,7 @@ def predict_orfs(filename, output_dir, meta_mode=False):
     logging.info(f"Finished processing {filename}")
 
 def process_genomes(input_files, output_dir, max_workers=None):
+    start_time = time.time()
     # Create the output directory if it doesn't exist
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -196,6 +198,9 @@ def process_genomes(input_files, output_dir, max_workers=None):
             except Exception as e:
                 logging.error(f"Exception occurred while processing {filename}: {traceback.format_exc()}")
                 raise e
+    end_time = time.time()
+    execution_time = end_time - start_time
+    logging.info(f"ORF detection completed in {execution_time:.2f} seconds")
 
 def count_fasta_headers(reference_file):
     """
@@ -207,6 +212,7 @@ def count_fasta_headers(reference_file):
     return header_count
 
 def parallel_bidirectional_best_hit(reference, queries, diamond_instance, output, core_threshold, **kwargs):
+    start_time = time.time()
     """
     Perform Bidirectional Best Hit (BBH) analysis between a reference genome and multiple query genomes using parallel processing.
 
@@ -300,6 +306,9 @@ def parallel_bidirectional_best_hit(reference, queries, diamond_instance, output
     coregenome_matrix.rename(columns={'sseqid': 'Core_Gene'}, inplace=True)
     coregenome_matrix.columns.name = None  # Remove the columns name
 
+    end_time = time.time()
+    execution_time = end_time - start_time
+    logging.info(f"BBH analysis completed in {execution_time:.2f} seconds")
     return result_df, coregenome_matrix
 
 async def check_and_extract_gene_sequences(core_gene, coregenome_matrix, orf_fnas, output_dir):
@@ -355,6 +364,7 @@ def align_and_save_gene(core_gene, sequences, output_dir, mafft):
         return core_gene, f"No sequences to align for {core_gene}, skipping..."
 
 async def extract_align_and_save_core_genes(coregenome_matrix, orf_fnas, output_dir, max_workers=4):
+    start_time = time.time()
     """
     Asynchronously extracts core genome genes, aligns them concurrently as they become available,
     and frees memory for completed genes.
@@ -464,6 +474,9 @@ async def extract_align_and_save_core_genes(coregenome_matrix, orf_fnas, output_
         task.cancel()
     
     alignment_executor.shutdown()
+    end_time = time.time()
+    execution_time = end_time - start_time
+    logging.info(f"Extraction and alignment completed in {execution_time:.2f} seconds")
 
 def compute_entropy(gene_file, core_genome_genes_dir):
     gene_id = os.path.splitext(gene_file)[0]
@@ -479,33 +492,32 @@ def process_chunk(chunk_index, chunk_gene_files, entropy_dict, core_genome_genes
         temp_file_filtered = tempfile.NamedTemporaryFile(mode='w+', delete=False, prefix=f'chunk_{chunk_index}_filtered_')
         temp_files = {'all': temp_file_all, 'filtered': temp_file_filtered}
 
-        concatenated_sequences_all = {}
-        concatenated_sequences_filtered = {}
-        genome_ids = None
+        chunk_data_all = {}
+        chunk_data_filtered = {}
 
         for gene_file in chunk_gene_files:
             gene_id = os.path.splitext(gene_file)[0]
             entropy = entropy_dict[gene_id]
             aln_path = os.path.join(core_genome_genes_dir, gene_file)
             alignment = AlignIO.read(aln_path, 'fasta')
+            
+            alignment_length = alignment.get_alignment_length()
+            sequences = {record.id: str(record.seq) for record in alignment}
+            
+            chunk_data_all[gene_id] = {
+                'length': alignment_length,
+                'sequences': sequences
+            }
+            
+            if entropy < entropy_threshold:
+                chunk_data_filtered[gene_id] = {
+                    'length': alignment_length,
+                    'sequences': sequences
+                }
 
-            if genome_ids is None:
-                genome_ids = [record.id for record in alignment]
-                for genome_id in genome_ids:
-                    concatenated_sequences_all[genome_id] = ''
-                    concatenated_sequences_filtered[genome_id] = ''
-
-            for record in alignment:
-                genome_id = record.id
-                seq = str(record.seq)
-                concatenated_sequences_all[genome_id] += seq
-                if entropy < entropy_threshold:
-                    concatenated_sequences_filtered[genome_id] += seq
-
-        # Write concatenated sequences to temporary files
-        for genome_id in genome_ids:
-            temp_files['all'].write(f">{genome_id}\n{concatenated_sequences_all[genome_id]}\n")
-            temp_files['filtered'].write(f">{genome_id}\n{concatenated_sequences_filtered[genome_id]}\n")
+        # Write chunk data to temporary files
+        json.dump(chunk_data_all, temp_files['all'])
+        json.dump(chunk_data_filtered, temp_files['filtered'])
 
         temp_files['all'].close()
         temp_files['filtered'].close()
@@ -555,6 +567,7 @@ def plot_entropy_distribution(entropy_dict, threshold, output_dir):
     plt.close()
 
 def concatenate_alignments(core_genome_genes_dir, final_output, final_output_F, output_dir, max_workers=4):
+    start_time = time.time()
     """
     Concatenate gene alignments into concatenated alignments for all genes and filtered genes in parallel.
 
@@ -621,18 +634,28 @@ def concatenate_alignments(core_genome_genes_dir, final_output, final_output_F, 
             temp_file_names.append(result)
 
     # Step 5: Combine temporary files
-    def merge_temp_files(output_file, temp_file_paths):
-        # Collect genome IDs to ensure consistent order
+    def merge_temp_files(output_file, temp_file_paths, partition_file):
         genome_sequences = {}
+        current_position = 1
+        partitions = []
+
         for temp_file in temp_file_paths:
             with open(temp_file, 'r') as f:
-                for record in SeqIO.parse(f, 'fasta'):
-                    genome_id = record.id
-                    seq = str(record.seq)
-                    if genome_id in genome_sequences:
+                chunk_data = json.load(f)
+                for gene_id, gene_data in chunk_data.items():
+                    alignment_length = gene_data['length']
+                    sequences = gene_data['sequences']
+                    
+                    for genome_id, seq in sequences.items():
+                        if genome_id not in genome_sequences:
+                            genome_sequences[genome_id] = ""
                         genome_sequences[genome_id] += seq
-                    else:
-                        genome_sequences[genome_id] = seq
+                    
+                    # Add partition information
+                    end_position = current_position + alignment_length - 1
+                    partitions.append(f"DNA, {gene_id} = {current_position}-{end_position}")
+                    current_position = end_position + 1
+            
             os.unlink(temp_file)  # Delete temp file after reading
 
         # Write merged sequences to the output file
@@ -640,15 +663,24 @@ def concatenate_alignments(core_genome_genes_dir, final_output, final_output_F, 
             for genome_id, seq in genome_sequences.items():
                 f_out.write(f">{genome_id}\n{seq}\n")
 
+        # Write partition file
+        with open(partition_file, 'w') as f_part:
+            f_part.write("\n".join(partitions))
+
     # Separate temp files for all genes and filtered genes
     temp_files_all = [pair[0] for pair in temp_file_names]
     temp_files_filtered = [pair[1] for pair in temp_file_names]
 
-    # Merge temporary files into final outputs
-    merge_temp_files(final_output, temp_files_all)
-    merge_temp_files(final_output_F, temp_files_filtered)
+    # Merge temporary files into final outputs and create partition files
+    partition_file_all = output_dir / 'partition_all.txt'
+    partition_file_filtered = output_dir / 'partition_filtered.txt'
+    merge_temp_files(final_output, temp_files_all, partition_file_all)
+    merge_temp_files(final_output_F, temp_files_filtered, partition_file_filtered)
 
-    logging.info("Concatenation completed.")
+    logging.info("Concatenation and partition file creation completed.")
+    end_time = time.time()
+    execution_time = end_time - start_time
+    logging.info(f"Concatenated alignment and partition file creation completed in {execution_time:.2f} seconds")
 
 def main():
     args, output_dir = parse_arguments()
@@ -661,8 +693,8 @@ def main():
     logging.debug(f"Output directory: {output_dir}")
 
     subdirs = create_output_directories(output_dir)
-    final_output = output_dir / 'core_genome.aln'
-    final_output_F = output_dir / 'core_genome_F.aln'
+    final_output = output_dir / 'core_genome_all.aln'
+    final_output_F = output_dir / 'core_genome_filtered.aln'
     results_table_path = output_dir / 'AAI_table.csv'
     pyrodigal_orfs = output_dir / 'pyrodigal_orfs'
     core_genome_genes = output_dir / 'core_genome_genes'
